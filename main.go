@@ -1000,8 +1000,6 @@ func (m *mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if composer, ok := m.current.(*tui.Composer); ok {
 			draftID = composer.GetDraftID()
 		}
-		m.current = tui.NewStatus("Sending email...")
-
 		// Get the account to send from
 		var account *config.Account
 		if msg.AccountID != "" && m.config != nil {
@@ -1010,6 +1008,12 @@ func (m *mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if account == nil && m.config != nil {
 			account = m.config.GetFirstAccount()
 		}
+
+		statusText := "Sending email..."
+		if msg.SignPGP && account != nil && account.PGPKeySource == "yubikey" {
+			statusText = "Touch your YubiKey to sign..."
+		}
+		m.current = tui.NewStatus(statusText)
 
 		// Save contact and delete draft in background
 		go func() {
@@ -1658,7 +1662,7 @@ func sendEmail(account *config.Account, msg tui.SendEmailMsg) tea.Cmd {
 			attachments[filename] = fileData
 		}
 
-		err := sender.SendEmail(account, recipients, cc, bcc, msg.Subject, body, string(htmlBody), images, attachments, msg.InReplyTo, msg.References, msg.SignSMIME, msg.EncryptSMIME)
+		err := sender.SendEmail(account, recipients, cc, bcc, msg.Subject, body, string(htmlBody), images, attachments, msg.InReplyTo, msg.References, msg.SignSMIME, msg.EncryptSMIME, msg.SignPGP, msg.EncryptPGP)
 		if err != nil {
 			log.Printf("Failed to send email: %v", err)
 			return tui.EmailResultMsg{Err: err}
@@ -2513,6 +2517,9 @@ func main() {
 		theme.SetTheme(cfg.Theme)
 	}
 	tui.RebuildStyles()
+
+	// Ensure PGP keys directory exists
+	_ = config.EnsurePGPDir()
 
 	var initialModel *mainModel
 	if err != nil {

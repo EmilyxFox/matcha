@@ -34,6 +34,14 @@ type Account struct {
 	SMIMEKey           string `json:"smime_key,omitempty"`             // Path to the private key PEM
 	SMIMESignByDefault bool   `json:"smime_sign_by_default,omitempty"` // Whether to enable S/MIME signing by default
 
+	// PGP settings
+	PGPPublicKey        string `json:"pgp_public_key,omitempty"`         // Path to public key (.asc or .gpg)
+	PGPPrivateKey       string `json:"pgp_private_key,omitempty"`        // Path to private key (.asc or .gpg)
+	PGPKeySource        string `json:"pgp_key_source,omitempty"`         // "file" (default) or "yubikey" for hardware key
+	PGPPIN              string `json:"-"`                                // YubiKey PIN (stored in keyring, not JSON)
+	PGPSignByDefault    bool   `json:"pgp_sign_by_default,omitempty"`    // Auto-sign outgoing emails
+	PGPEncryptByDefault bool   `json:"pgp_encrypt_by_default,omitempty"` // Auto-encrypt when recipient keys available
+
 	// OAuth2 settings
 	AuthMethod string `json:"auth_method,omitempty"` // "password" (default) or "oauth2"
 
@@ -159,12 +167,16 @@ func configFile() (string, error) {
 
 // SaveConfig saves the given configuration to the config file and passwords to the keyring.
 func SaveConfig(config *Config) error {
-	// Save passwords to the OS keyring before writing the JSON file
+	// Save passwords and PGP PINs to the OS keyring before writing the JSON file
 	for _, acc := range config.Accounts {
 		if acc.Password != "" {
 			// We ignore the error here because some environments (like headless CI)
 			// might not have a keyring service, but we still want to save the rest of the config.
 			_ = keyring.Set(keyringServiceName, acc.Email, acc.Password)
+		}
+		// Save YubiKey PIN if present
+		if acc.PGPPIN != "" && acc.PGPKeySource == "yubikey" {
+			_ = keyring.Set(keyringServiceName, acc.Email+":pgp-pin", acc.PGPPIN)
 		}
 	}
 
@@ -198,25 +210,30 @@ func LoadConfig() (*Config, error) {
 	var needsMigration bool
 
 	type rawAccount struct {
-		ID                 string `json:"id"`
-		Name               string `json:"name"`
-		Email              string `json:"email"`
-		Password           string `json:"password,omitempty"`
-		ServiceProvider    string `json:"service_provider"`
-		FetchEmail         string `json:"fetch_email,omitempty"`
-		IMAPServer         string `json:"imap_server,omitempty"`
-		IMAPPort           int    `json:"imap_port,omitempty"`
-		SMTPServer         string `json:"smtp_server,omitempty"`
-		SMTPPort           int    `json:"smtp_port,omitempty"`
-		Insecure           bool   `json:"insecure,omitempty"`
-		SMIMECert          string `json:"smime_cert,omitempty"`
-		SMIMEKey           string `json:"smime_key,omitempty"`
-		SMIMESignByDefault bool   `json:"smime_sign_by_default,omitempty"`
-		AuthMethod         string `json:"auth_method,omitempty"`
-		Protocol           string `json:"protocol,omitempty"`
-		JMAPEndpoint       string `json:"jmap_endpoint,omitempty"`
-		POP3Server         string `json:"pop3_server,omitempty"`
-		POP3Port           int    `json:"pop3_port,omitempty"`
+		ID                  string `json:"id"`
+		Name                string `json:"name"`
+		Email               string `json:"email"`
+		Password            string `json:"password,omitempty"`
+		ServiceProvider     string `json:"service_provider"`
+		FetchEmail          string `json:"fetch_email,omitempty"`
+		IMAPServer          string `json:"imap_server,omitempty"`
+		IMAPPort            int    `json:"imap_port,omitempty"`
+		SMTPServer          string `json:"smtp_server,omitempty"`
+		SMTPPort            int    `json:"smtp_port,omitempty"`
+		Insecure            bool   `json:"insecure,omitempty"`
+		SMIMECert           string `json:"smime_cert,omitempty"`
+		SMIMEKey            string `json:"smime_key,omitempty"`
+		SMIMESignByDefault  bool   `json:"smime_sign_by_default,omitempty"`
+		PGPPublicKey        string `json:"pgp_public_key,omitempty"`
+		PGPPrivateKey       string `json:"pgp_private_key,omitempty"`
+		PGPKeySource        string `json:"pgp_key_source,omitempty"`
+		PGPSignByDefault    bool   `json:"pgp_sign_by_default,omitempty"`
+		PGPEncryptByDefault bool   `json:"pgp_encrypt_by_default,omitempty"`
+		AuthMethod          string `json:"auth_method,omitempty"`
+		Protocol            string `json:"protocol,omitempty"`
+		JMAPEndpoint        string `json:"jmap_endpoint,omitempty"`
+		POP3Server          string `json:"pop3_server,omitempty"`
+		POP3Port            int    `json:"pop3_port,omitempty"`
 	}
 	type diskConfig struct {
 		Accounts             []rawAccount  `json:"accounts"`
@@ -259,24 +276,29 @@ func LoadConfig() (*Config, error) {
 	config.MailingLists = raw.MailingLists
 	for _, rawAcc := range raw.Accounts {
 		acc := Account{
-			ID:                 rawAcc.ID,
-			Name:               rawAcc.Name,
-			Email:              rawAcc.Email,
-			ServiceProvider:    rawAcc.ServiceProvider,
-			FetchEmail:         rawAcc.FetchEmail,
-			IMAPServer:         rawAcc.IMAPServer,
-			IMAPPort:           rawAcc.IMAPPort,
-			SMTPServer:         rawAcc.SMTPServer,
-			SMTPPort:           rawAcc.SMTPPort,
-			Insecure:           rawAcc.Insecure,
-			SMIMECert:          rawAcc.SMIMECert,
-			SMIMEKey:           rawAcc.SMIMEKey,
-			SMIMESignByDefault: rawAcc.SMIMESignByDefault,
-			AuthMethod:         rawAcc.AuthMethod,
-			Protocol:           rawAcc.Protocol,
-			JMAPEndpoint:       rawAcc.JMAPEndpoint,
-			POP3Server:         rawAcc.POP3Server,
-			POP3Port:           rawAcc.POP3Port,
+			ID:                  rawAcc.ID,
+			Name:                rawAcc.Name,
+			Email:               rawAcc.Email,
+			ServiceProvider:     rawAcc.ServiceProvider,
+			FetchEmail:          rawAcc.FetchEmail,
+			IMAPServer:          rawAcc.IMAPServer,
+			IMAPPort:            rawAcc.IMAPPort,
+			SMTPServer:          rawAcc.SMTPServer,
+			SMTPPort:            rawAcc.SMTPPort,
+			Insecure:            rawAcc.Insecure,
+			SMIMECert:           rawAcc.SMIMECert,
+			SMIMEKey:            rawAcc.SMIMEKey,
+			SMIMESignByDefault:  rawAcc.SMIMESignByDefault,
+			PGPPublicKey:        rawAcc.PGPPublicKey,
+			PGPPrivateKey:       rawAcc.PGPPrivateKey,
+			PGPKeySource:        rawAcc.PGPKeySource,
+			PGPSignByDefault:    rawAcc.PGPSignByDefault,
+			PGPEncryptByDefault: rawAcc.PGPEncryptByDefault,
+			AuthMethod:          rawAcc.AuthMethod,
+			Protocol:            rawAcc.Protocol,
+			JMAPEndpoint:        rawAcc.JMAPEndpoint,
+			POP3Server:          rawAcc.POP3Server,
+			POP3Port:            rawAcc.POP3Port,
 		}
 
 		if rawAcc.Password != "" {
@@ -288,6 +310,13 @@ func LoadConfig() (*Config, error) {
 			// No plaintext password in JSON, fetch from Keyring as normal.
 			if pwd, err := keyring.Get(keyringServiceName, acc.Email); err == nil {
 				acc.Password = pwd
+			}
+		}
+
+		// Load YubiKey PIN from keyring if using YubiKey
+		if acc.PGPKeySource == "yubikey" {
+			if pin, err := keyring.Get(keyringServiceName, acc.Email+":pgp-pin"); err == nil {
+				acc.PGPPIN = pin
 			}
 		}
 
@@ -329,6 +358,8 @@ func (c *Config) RemoveAccount(id string) bool {
 		if acc.ID == id {
 			// Delete password from OS Keyring when account is removed
 			_ = keyring.Delete(keyringServiceName, acc.Email)
+			// Delete PGP PIN from OS Keyring if present
+			_ = keyring.Delete(keyringServiceName, acc.Email+":pgp-pin")
 
 			c.Accounts = append(c.Accounts[:i], c.Accounts[i+1:]...)
 			return true
@@ -368,4 +399,14 @@ func (c *Config) GetFirstAccount() *Account {
 		return &c.Accounts[0]
 	}
 	return nil
+}
+
+// EnsurePGPDir creates the PGP keys directory if it doesn't exist.
+func EnsurePGPDir() error {
+	dir, err := configDir()
+	if err != nil {
+		return err
+	}
+	pgpDir := filepath.Join(dir, "pgp")
+	return os.MkdirAll(pgpDir, 0700)
 }

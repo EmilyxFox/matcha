@@ -17,9 +17,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/mail"
+	"github.com/emersion/go-pgpmail"
 	"github.com/floatpane/matcha/config"
 	"go.mozilla.org/pkcs7"
 	"golang.org/x/text/encoding/ianaindex"
@@ -38,6 +40,9 @@ type Attachment struct {
 	IsSMIMESignature bool   // True if this attachment is an S/MIME signature
 	SMIMEVerified    bool   // True if the S/MIME signature was verified successfully
 	IsSMIMEEncrypted bool   // True if the S/MIME content was successfully decrypted
+	IsPGPSignature   bool   // True if this attachment is a PGP signature
+	PGPVerified      bool   // True if the PGP signature was verified successfully
+	IsPGPEncrypted   bool   // True if the PGP content was successfully decrypted
 }
 
 type Email struct {
@@ -729,6 +734,122 @@ func FetchEmailBodyFromMailbox(account *config.Account, mailbox string, uid uint
 				}
 			}
 			attachments = append(attachments, att)
+		}
+
+		// === PGP ENCRYPTED MESSAGE DETECTION ===
+		if mimeType == "application/pgp-encrypted" || (mimeType == "multipart/encrypted" && strings.Contains(part.MIMESubType, "pgp")) {
+			// PGP encrypted messages typically have two parts:
+			// 1. Version info (application/pgp-encrypted)
+			// 2. Encrypted data (application/octet-stream)
+			// We'll handle decryption when we find the encrypted data part
+			// Skip this part and continue processing
+		}
+
+		// Detect encrypted data part of PGP message
+		if strings.Contains(filename, ".asc") || (mimeType == "application/octet-stream" && part.Encoding == "7bit") {
+			// This might be PGP encrypted data
+			data, err := fetchInlinePart(partID, part.Encoding)
+			if err == nil && bytes.Contains(data, []byte("-----BEGIN PGP MESSAGE-----")) {
+				// This is PGP encrypted content
+				if account.PGPPrivateKey != "" {
+					decrypted, err := decryptPGPMessage(data, account)
+					if err == nil {
+						// Parse the decrypted MIME content
+						mr, err := mail.CreateReader(bytes.NewReader(decrypted))
+						if err == nil {
+							for {
+								p, err := mr.NextPart()
+								if err == io.EOF {
+									break
+								}
+								if err != nil {
+									break
+								}
+
+								switch h := p.Header.(type) {
+								case *mail.InlineHeader:
+									ct, _, _ := h.ContentType()
+									if strings.HasPrefix(ct, "text/html") {
+										body, _ := io.ReadAll(p.Body)
+										extractedBody = string(body)
+										htmlPartID = "decrypted"
+									} else if strings.HasPrefix(ct, "text/plain") && extractedBody == "" {
+										body, _ := io.ReadAll(p.Body)
+										extractedBody = string(body)
+										htmlPartID = "decrypted"
+									}
+								}
+							}
+
+							// Add status marker
+							attachments = append(attachments, Attachment{
+								Filename:       "pgp-status.internal",
+								IsPGPEncrypted: true,
+								PGPVerified:    true, // Decryption succeeded
+							})
+						}
+					} else {
+						extractedBody = fmt.Sprintf("**PGP Decryption Failed:** %s\n", err)
+						htmlPartID = "extracted"
+					}
+				} else {
+					extractedBody = "**PGP Encrypted:** Private key not configured\n"
+					htmlPartID = "extracted"
+				}
+			}
+		}
+
+		// === PGP DETACHED SIGNATURE VERIFICATION ===
+		if filename == "signature.asc" || mimeType == "application/pgp-signature" {
+			att := Attachment{
+				Filename:       filename,
+				PartID:         partID,
+				Encoding:       part.Encoding,
+				MIMEType:       mimeType,
+				ContentID:      contentID,
+				Inline:         isInline,
+				IsPGPSignature: true,
+			}
+
+			if data, err := fetchInlinePart(partID, part.Encoding); err == nil {
+				att.Data = data
+
+				// Try to verify the signature
+				boundary := msg.BodyStructure.Params["boundary"]
+				if boundary != "" {
+					rawEmail, err := fetchWholeMessage()
+					if err == nil {
+						// Extract signed content (similar to S/MIME)
+						fullBoundary := []byte("--" + boundary)
+						firstIdx := bytes.Index(rawEmail, fullBoundary)
+						if firstIdx != -1 {
+							startIdx := firstIdx + len(fullBoundary)
+							if startIdx < len(rawEmail) && rawEmail[startIdx] == '\r' {
+								startIdx++
+							}
+							if startIdx < len(rawEmail) && rawEmail[startIdx] == '\n' {
+								startIdx++
+							}
+							secondIdx := bytes.Index(rawEmail[startIdx:], fullBoundary)
+							if secondIdx != -1 {
+								endIdx := startIdx + secondIdx
+								if endIdx > 0 && rawEmail[endIdx-1] == '\n' {
+									endIdx--
+								}
+								if endIdx > 0 && rawEmail[endIdx-1] == '\r' {
+									endIdx--
+								}
+								signedData := rawEmail[startIdx:endIdx]
+
+								// Verify PGP signature
+								verified := verifyPGPSignature(signedData, data, account)
+								att.PGPVerified = verified
+							}
+						}
+					}
+				}
+			}
+			attachments = append(attachments, att)
 		} else if (filename != "" || isCID) && (part.Disposition == "attachment" || isInline || part.MIMEType != "text") {
 			att := Attachment{
 				Filename:  filename,
@@ -1335,4 +1456,128 @@ func DeleteFolderEmail(account *config.Account, folder string, uid uint32) error
 // ArchiveFolderEmail archives an email from an arbitrary folder.
 func ArchiveFolderEmail(account *config.Account, folder string, uid uint32) error {
 	return ArchiveEmailFromMailbox(account, folder, uid)
+}
+
+// decryptPGPMessage decrypts a PGP-encrypted message using the account's private key.
+func decryptPGPMessage(encryptedData []byte, account *config.Account) ([]byte, error) {
+	if account.PGPPrivateKey == "" {
+		return nil, errors.New("PGP private key not configured")
+	}
+
+	// Load private key
+	keyFile, err := os.ReadFile(account.PGPPrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read PGP private key: %w", err)
+	}
+
+	// Try armored format first
+	entityList, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(keyFile))
+	if err != nil {
+		// Try binary format
+		entityList, err = openpgp.ReadKeyRing(bytes.NewReader(keyFile))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse PGP private key: %w", err)
+		}
+	}
+
+	if len(entityList) == 0 {
+		return nil, errors.New("no PGP keys found in private keyring")
+	}
+
+	// Decrypt using go-pgpmail
+	mr, err := pgpmail.Read(bytes.NewReader(encryptedData), openpgp.EntityList{entityList[0]}, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt PGP message: %w", err)
+	}
+
+	// Read decrypted content from UnverifiedBody
+	if mr.MessageDetails == nil || mr.MessageDetails.UnverifiedBody == nil {
+		return nil, errors.New("no decrypted content available")
+	}
+
+	var decrypted bytes.Buffer
+	if _, err := io.Copy(&decrypted, mr.MessageDetails.UnverifiedBody); err != nil {
+		return nil, fmt.Errorf("failed to read decrypted content: %w", err)
+	}
+
+	return decrypted.Bytes(), nil
+}
+
+// loadPGPKeyring builds an openpgp.EntityList from the account's public key
+// and any keys stored in the pgp/ config directory.
+func loadPGPKeyring(account *config.Account) openpgp.EntityList {
+	var keyring openpgp.EntityList
+
+	readKeys := func(path string) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		entities, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(data))
+		if err != nil {
+			entities, err = openpgp.ReadKeyRing(bytes.NewReader(data))
+			if err != nil {
+				return
+			}
+		}
+		keyring = append(keyring, entities...)
+	}
+
+	// Load account's own public key
+	if account.PGPPublicKey != "" {
+		readKeys(account.PGPPublicKey)
+	}
+
+	// Load all keys from the pgp/ config directory
+	cfgDir, err := config.GetConfigDir()
+	if err == nil {
+		pgpDir := cfgDir + "/pgp"
+		entries, err := os.ReadDir(pgpDir)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+				name := entry.Name()
+				if strings.HasSuffix(name, ".asc") || strings.HasSuffix(name, ".gpg") {
+					readKeys(pgpDir + "/" + name)
+				}
+			}
+		}
+	}
+
+	return keyring
+}
+
+// verifyPGPSignature verifies a PGP detached signature against signed content.
+func verifyPGPSignature(signedContent, signatureData []byte, account *config.Account) bool {
+	keyring := loadPGPKeyring(account)
+	if len(keyring) == 0 {
+		return false
+	}
+
+	// Build a complete multipart/signed message for go-pgpmail
+	boundary := "pgp-verify-boundary"
+	var msg bytes.Buffer
+	msg.WriteString("Content-Type: multipart/signed; boundary=\"" + boundary + "\"; micalg=pgp-sha256; protocol=\"application/pgp-signature\"\r\n\r\n")
+	msg.WriteString("--" + boundary + "\r\n")
+	msg.Write(signedContent)
+	msg.WriteString("\r\n--" + boundary + "\r\n")
+	msg.WriteString("Content-Type: application/pgp-signature\r\n\r\n")
+	msg.Write(signatureData)
+	msg.WriteString("\r\n--" + boundary + "--\r\n")
+
+	mr, err := pgpmail.Read(&msg, keyring, nil, nil)
+	if err != nil {
+		return false
+	}
+
+	if mr.MessageDetails == nil {
+		return false
+	}
+
+	// Must read UnverifiedBody to EOF to trigger signature verification
+	_, _ = io.ReadAll(mr.MessageDetails.UnverifiedBody)
+
+	return mr.MessageDetails.SignatureError == nil
 }
