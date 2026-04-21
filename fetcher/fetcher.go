@@ -264,6 +264,7 @@ func connectWithOptions(account *config.Account, extraOpts *imapclient.Options) 
 		TLSConfig: &tls.Config{
 			ServerName:         imapServer,
 			InsecureSkipVerify: account.Insecure,
+			MinVersion:         tls.VersionTLS12,
 		},
 	}
 	if extraOpts != nil {
