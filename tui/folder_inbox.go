@@ -56,6 +56,26 @@ var (
 				PaddingLeft(1).
 				Foreground(lipgloss.Color("42")).
 				Bold(true)
+
+	inboxPaneStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderRight(true).
+			PaddingRight(1)
+
+	previewPaneStyle = lipgloss.NewStyle().
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderLeft(true).
+				PaddingLeft(1)
+
+	focusedBorderColor   = lipgloss.Color("42")
+	unfocusedBorderColor = lipgloss.Color("240")
+)
+
+type PaneType int
+
+const (
+	FocusInbox PaneType = iota
+	FocusPreview
 )
 
 // FolderInbox combines a folder sidebar with an email list.
@@ -76,6 +96,12 @@ type FolderInbox struct {
 	moveUIDs         []uint32 // Batch: multiple UIDs
 	moveAccountID    string
 	moveSourceFolder string
+
+	// Split pane state
+	previewPane        *EmailView
+	previewedUID       uint32
+	previewedAccountID string
+	focusedPane        PaneType
 }
 
 // sortFolders sorts folder names with INBOX always first, then alphabetically.
@@ -113,19 +139,16 @@ func NewFolderInbox(folders []string, accounts []config.Account) *FolderInbox {
 
 	inbox := NewInbox(nil, accounts)
 	inbox.SetFolderName(currentFolder)
-	inbox.extraShortHelpKeys = []key.Binding{
-		key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next folder")),
-		key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev folder")),
-		key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "move")),
-	}
 
-	return &FolderInbox{
+	fi := &FolderInbox{
 		folders:         folders,
 		activeFolderIdx: 0,
 		currentFolder:   currentFolder,
 		inbox:           inbox,
 		accounts:        accounts,
 	}
+	fi.updateHelpKeys()
+	return fi
 }
 
 func (m *FolderInbox) Init() tea.Cmd {
@@ -144,7 +167,30 @@ func (m *FolderInbox) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.inbox.list.FilterState() == list.Filtering {
 			break
 		}
+
+		// Route input to preview pane when focused
+		if m.previewPane != nil && m.focusedPane == FocusPreview {
+			s := msg.String()
+			if s != "[" && s != "]" && s != "esc" && s != "q" {
+				var cmd tea.Cmd
+				_, cmd = m.previewPane.Update(msg)
+				return m, cmd
+			}
+		}
+
 		switch msg.String() {
+		case "]":
+			// Switch focus to preview pane
+			if m.previewPane != nil && m.focusedPane == FocusInbox {
+				m.focusedPane = FocusPreview
+				return m, nil
+			}
+		case "[":
+			// Switch focus to inbox pane
+			if m.previewPane != nil && m.focusedPane == FocusPreview {
+				m.focusedPane = FocusInbox
+				return m, nil
+			}
 		case "tab":
 			m.activeFolderIdx++
 			if m.activeFolderIdx >= len(m.folders) {
@@ -157,6 +203,13 @@ func (m *FolderInbox) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.activeFolderIdx = len(m.folders) - 1
 			}
 			return m, m.switchFolder()
+		case "esc":
+			// Close split preview if open
+			if m.previewPane != nil {
+				m.closeSplitPreview()
+				return m, nil
+			}
+			// Otherwise let inbox handle (or parent)
 		case "m":
 			// Start move-to-folder flow
 			if m.inbox.visualMode && len(m.inbox.selectedUIDs) > 0 {
@@ -190,11 +243,24 @@ func (m *FolderInbox) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		inboxWidth := msg.Width - sidebarWidth - 3 // 3 for border + padding
-		if inboxWidth < 20 {
-			inboxWidth = 20
+		if m.previewPane != nil || m.previewedUID != 0 {
+			// Recalculate pane widths for split mode
+			inboxWidth := m.calculateInboxWidth()
+			previewWidth := m.calculatePreviewWidth()
+			m.inbox.SetSize(inboxWidth-2, msg.Height)
+			if m.previewPane != nil {
+				// Forward resize to EmailView with preview pane dimensions
+				previewMsg := tea.WindowSizeMsg{Width: previewWidth - 2, Height: msg.Height - 2}
+				m.previewPane.Update(previewMsg)
+			}
+		} else {
+			// Original two-pane resize
+			inboxWidth := msg.Width - sidebarWidth - 3
+			if inboxWidth < 20 {
+				inboxWidth = 20
+			}
+			m.inbox.SetSize(inboxWidth, msg.Height)
 		}
-		m.inbox.SetSize(inboxWidth, msg.Height)
 		return m, nil
 
 	case FolderEmailsFetchedMsg:
@@ -236,6 +302,44 @@ func (m *FolderInbox) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.inbox.RemoveEmail(msg.UID, msg.AccountID)
+		// Clear preview if moved email was being previewed
+		if msg.UID == m.previewedUID {
+			m.closeSplitPreview()
+		}
+		return m, nil
+
+	case UpdatePreviewMsg:
+		// Stale update, ignore
+		if msg.UID == m.previewedUID && m.previewPane != nil {
+			return m, nil
+		}
+		m.previewedUID = msg.UID
+		m.previewedAccountID = msg.AccountID
+		// Will trigger fetch in main.go
+		return m, nil
+
+	case PreviewBodyFetchedMsg:
+		// Stale fetch or no preview active
+		if msg.UID != m.previewedUID {
+			return m, nil
+		}
+		if msg.Err != nil {
+			// Show error in preview pane
+			return m, nil
+		}
+		// Find email and create preview
+		email := m.findEmailByUID(msg.UID, msg.AccountID)
+		if email == nil {
+			return m, nil
+		}
+		// Update email with body
+		email.Body = msg.Body
+		email.Attachments = msg.Attachments
+		// Create preview pane with column offset for image rendering
+		previewWidth := m.calculatePreviewWidth()
+		inboxWidth := m.calculateInboxWidth()
+		colOffset := sidebarWidth + 2 + inboxWidth + 2 // borders + padding
+		m.previewPane = NewEmailViewPreview(*email, previewWidth, m.height, colOffset, false)
 		return m, nil
 	}
 
@@ -365,11 +469,23 @@ func (m *FolderInbox) View() tea.View {
 	// Render sidebar
 	sidebar := m.renderSidebar()
 
-	// Render inbox
-	inboxView := m.inbox.View().Content
+	var content string
 
-	// Join horizontally
-	content := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, inboxView)
+	if m.previewPane != nil {
+		// Three-pane layout: folders | inbox | email preview
+		inboxPane := m.renderInboxPane()
+		previewPane := m.renderPreviewPane()
+		content = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, inboxPane, previewPane)
+	} else if m.previewedUID != 0 {
+		// Split pane loading state (body being fetched)
+		inboxPane := m.renderInboxPane()
+		emptyPreview := m.renderEmptyPreview()
+		content = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, inboxPane, emptyPreview)
+	} else {
+		// Two-pane layout (original): folders | inbox
+		inboxView := m.inbox.View().Content
+		content = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, inboxView)
+	}
 
 	// If move overlay is active, render it on top
 	if m.movingEmail {
@@ -544,13 +660,20 @@ func (m *FolderInbox) RemoveEmail(uid uint32, accountID string) {
 	m.inbox.RemoveEmail(uid, accountID)
 }
 
-// AdditionalShortHelpKeys returns help key bindings for the folder inbox.
-func (m *FolderInbox) AdditionalShortHelpKeys() []key.Binding {
-	return []key.Binding{
+// updateHelpKeys refreshes the inbox help keys based on preview state
+func (m *FolderInbox) updateHelpKeys() {
+	bindings := []key.Binding{
 		key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next folder")),
 		key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "prev folder")),
-		key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "move to folder")),
+		key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "move")),
 	}
+	if m.previewPane != nil || m.previewedUID != 0 {
+		bindings = append(bindings,
+			key.NewBinding(key.WithKeys("]"), key.WithHelp("]/[", "switch pane")),
+			key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "close preview")),
+		)
+	}
+	m.inbox.extraShortHelpKeys = bindings
 }
 
 // SetLoadingEmails sets the loading state.
@@ -578,4 +701,118 @@ func (m *FolderInbox) GetFolders() []string {
 // Helper to get the formatted inbox title
 func folderInboxTitle(folder string) string {
 	return fmt.Sprintf("Folder: %s", folder)
+}
+
+// renderInboxPane renders inbox with border for split pane mode
+func (m *FolderInbox) renderInboxPane() string {
+	inboxWidth := m.calculateInboxWidth()
+
+	borderColor := unfocusedBorderColor
+	if m.focusedPane == FocusInbox {
+		borderColor = focusedBorderColor
+	}
+
+	paneStyle := inboxPaneStyle.
+		BorderForeground(borderColor).
+		Width(inboxWidth).
+		Height(m.height)
+
+	m.inbox.SetSize(inboxWidth-2, m.height)
+	return paneStyle.Render(m.inbox.View().Content)
+}
+
+// renderPreviewPane renders email preview with border
+func (m *FolderInbox) renderPreviewPane() string {
+	if m.previewPane == nil {
+		return m.renderEmptyPreview()
+	}
+
+	previewWidth := m.calculatePreviewWidth()
+
+	borderColor := unfocusedBorderColor
+	if m.focusedPane == FocusPreview {
+		borderColor = focusedBorderColor
+	}
+
+	paneStyle := previewPaneStyle.
+		BorderForeground(borderColor).
+		Width(previewWidth).
+		Height(m.height)
+
+	return paneStyle.Render(m.previewPane.View().Content)
+}
+
+// renderEmptyPreview renders placeholder when no email selected
+func (m *FolderInbox) renderEmptyPreview() string {
+	previewWidth := m.calculatePreviewWidth()
+
+	emptyStyle := lipgloss.NewStyle().
+		Width(previewWidth).
+		Height(m.height).
+		Align(lipgloss.Center, lipgloss.Center).
+		Foreground(lipgloss.Color("240"))
+
+	return emptyStyle.Render("Loading...")
+}
+
+// OpenSplitPreview opens the split preview pane for a specific email
+func (m *FolderInbox) OpenSplitPreview(uid uint32, accountID string) {
+	m.previewPane = nil // Will be created when body arrives
+	m.previewedUID = uid
+	m.previewedAccountID = accountID
+	m.focusedPane = FocusPreview
+	// Recalculate inbox width for split mode
+	inboxWidth := m.calculateInboxWidth()
+	m.inbox.SetSize(inboxWidth-2, m.height)
+	m.updateHelpKeys()
+}
+
+// closeSplitPreview closes the preview pane and returns to inbox-only
+func (m *FolderInbox) closeSplitPreview() {
+	ClearKittyGraphics()
+	m.previewPane = nil
+	m.previewedUID = 0
+	m.previewedAccountID = ""
+	m.focusedPane = FocusInbox
+	// Restore full inbox width
+	inboxWidth := m.width - sidebarWidth - 3
+	if inboxWidth < 20 {
+		inboxWidth = 20
+	}
+	m.inbox.SetSize(inboxWidth, m.height)
+	m.updateHelpKeys()
+}
+
+// findEmailByUID finds email in inbox by UID and account ID
+func (m *FolderInbox) findEmailByUID(uid uint32, accountID string) *fetcher.Email {
+	for i := range m.inbox.allEmails {
+		if m.inbox.allEmails[i].UID == uid && m.inbox.allEmails[i].AccountID == accountID {
+			return &m.inbox.allEmails[i]
+		}
+	}
+	return nil
+}
+
+// calculatePreviewWidth calculates width for preview pane
+func (m *FolderInbox) calculatePreviewWidth() int {
+	remainingWidth := m.width - sidebarWidth - 4 // 4 for borders
+	inboxWidth := int(float64(remainingWidth) * 0.4)
+	if inboxWidth < 30 {
+		inboxWidth = 30
+	}
+	previewWidth := remainingWidth - inboxWidth
+	if previewWidth < 40 {
+		previewWidth = 40
+	}
+	return previewWidth
+}
+
+// calculateInboxWidth calculates width for inbox pane in split mode
+func (m *FolderInbox) calculateInboxWidth() int {
+	remainingWidth := m.width - sidebarWidth - 4
+	inboxWidth := int(float64(remainingWidth) * 0.4)
+	if inboxWidth < 30 {
+		inboxWidth = 30
+	}
+	return inboxWidth
 }
