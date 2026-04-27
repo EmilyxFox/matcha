@@ -235,14 +235,36 @@ func konsoleSupported() bool {
 	return false
 }
 
+func zellijSupported() bool {
+	return os.Getenv("ZELLIJ") != "" || os.Getenv("ZELLIJ_SESSION_NAME") != ""
+}
+
+func sixelSupported() bool {
+	// Zellij always supports Sixel
+	if zellijSupported() {
+		return true
+	}
+
+	// Native Sixel terminals
+	term := strings.ToLower(os.Getenv("TERM"))
+	return strings.Contains(term, "mlterm") ||
+		strings.Contains(term, "foot") ||
+		(strings.Contains(term, "xterm") && os.Getenv("SIXEL") == "1")
+}
+
 // ImageProtocolSupported checks if any supported image protocol terminal is detected.
 func ImageProtocolSupported() bool {
 	return imageProtocolSupported()
 }
 
+// SixelSupported returns true if the terminal uses the Sixel graphics protocol.
+func SixelSupported() bool {
+	return sixelSupported()
+}
+
 // imageProtocolSupported checks if any supported image protocol terminal is detected.
 func imageProtocolSupported() bool {
-	return kittySupported() || ghosttySupported() || iterm2Supported() ||
+	return sixelSupported() || kittySupported() || ghosttySupported() || iterm2Supported() ||
 		weztermSupported() || waystSupported() || warpSupported() || konsoleSupported()
 }
 
@@ -422,10 +444,52 @@ func iterm2InlineImage(payload string) string {
 	return result
 }
 
+// sixelInlineImage returns Sixel escape sequence + newline placeholders
+func sixelInlineImage(base64PNG string) string {
+	data, err := base64.StdEncoding.DecodeString(base64PNG)
+	if err != nil {
+		return ""
+	}
+
+	cellHeight := getTerminalCellSize()
+	sixel, rows, err := clib.EncodePNGToSixel(data, cellHeight)
+	if err != nil {
+		debugImageProtocol("Sixel encoding failed: %v", err)
+		return ""
+	}
+
+	debugImageProtocol("Sixel: encoded %d bytes, %d rows", len(sixel), rows)
+
+	// Sixel sequences don't auto-advance cursor
+	// Add newlines to preserve layout
+	return sixel + strings.Repeat("\n", rows)
+}
+
+// sixelImageEscapeOnly returns raw Sixel for out-of-band rendering
+func sixelImageEscapeOnly(base64PNG string) string {
+	data, err := base64.StdEncoding.DecodeString(base64PNG)
+	if err != nil {
+		return ""
+	}
+
+	cellHeight := getTerminalCellSize()
+	sixel, _, err := clib.EncodePNGToSixel(data, cellHeight)
+	if err != nil {
+		return ""
+	}
+
+	return sixel
+}
+
 // renderInlineImage renders an image using the appropriate protocol for the detected terminal
 func renderInlineImage(payload string) string {
 	if payload == "" {
 		return ""
+	}
+
+	// Priority: Sixel in multiplexers overrides native protocols
+	if sixelSupported() {
+		return sixelInlineImage(payload)
 	}
 
 	if kittySupported() || ghosttySupported() || weztermSupported() || waystSupported() || konsoleSupported() {
@@ -519,6 +583,27 @@ func RenderImageToStdout(placement *ImagePlacement, screenRow int, screenCol ...
 		col = screenCol[0]
 	}
 
+	// Priority: Sixel in multiplexers
+	if sixelSupported() {
+		debugImageProtocol("Sixel: RenderImageToStdout row=%d col=%d base64len=%d", screenRow, col, len(placement.Base64))
+
+		// Encode once, reuse cached Sixel on subsequent renders (like Kitty's upload-once pattern)
+		if placement.SixelEncoded == "" {
+			placement.SixelEncoded = sixelImageEscapeOnly(placement.Base64)
+			if placement.SixelEncoded == "" {
+				debugImageProtocol("Sixel: sixelImageEscapeOnly returned empty")
+				return
+			}
+		}
+
+		debugImageProtocol("Sixel: rendering %d bytes at row=%d col=%d", len(placement.SixelEncoded), screenRow+1, col)
+		// Position cursor + render Sixel
+		fmt.Fprintf(os.Stdout, "\x1b[s\x1b[%d;%dH%s\x1b[u",
+			screenRow+1, col, placement.SixelEncoded)
+		os.Stdout.Sync()
+		return
+	}
+
 	useKitty := kittySupported() || ghosttySupported() || weztermSupported() || waystSupported() || konsoleSupported()
 	useIterm2 := iterm2Supported() || warpSupported()
 
@@ -564,11 +649,12 @@ type InlineImage struct {
 // line in the email body. Images are rendered directly to stdout (bypassing
 // bubbletea's cell-based renderer which cannot handle graphics protocols).
 type ImagePlacement struct {
-	Line     int    // Line number in the processed body text where the image starts
-	Base64   string // Base64-encoded image data (PNG)
-	Rows     int    // Number of terminal rows the image occupies
-	Uploaded bool   // Whether the image has been uploaded to the terminal via Kitty ID
-	ID       uint32 // Kitty image ID for display-by-reference
+	Line         int    // Line number in the processed body text where the image starts
+	Base64       string // Base64-encoded image data (PNG)
+	Rows         int    // Number of terminal rows the image occupies
+	Uploaded     bool   // Whether the image has been uploaded to the terminal via Kitty ID
+	ID           uint32 // Kitty image ID for display-by-reference
+	SixelEncoded string // Cached Sixel escape sequence (encode once, reuse on scroll)
 }
 
 // ProcessBodyWithInline renders the body and resolves CID inline images when provided.
