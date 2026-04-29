@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"github.com/floatpane/matcha/backend"
 	"github.com/floatpane/matcha/calendar"
 	"github.com/floatpane/matcha/config"
 	"github.com/floatpane/matcha/daemonrpc"
@@ -21,6 +22,7 @@ type ViewEmailMsg struct {
 	UID       uint32
 	AccountID string
 	Mailbox   MailboxKind
+	Email     *fetcher.Email
 }
 
 type SendEmailMsg struct {
@@ -100,6 +102,24 @@ type PreviewBodyFetchedMsg struct {
 }
 
 type FetchErr error
+
+type SearchRequestedMsg struct {
+	Query      backend.SearchQuery
+	Mailbox    MailboxKind
+	FolderName string
+	AccountID  string
+}
+
+type SearchResultsMsg struct {
+	Query  backend.SearchQuery
+	Emails []fetcher.Email
+	Err    error
+}
+
+type ApplySearchResultsMsg struct {
+	Query  backend.SearchQuery
+	Emails []fetcher.Email
+}
 
 type GoToInboxMsg struct{}
 
