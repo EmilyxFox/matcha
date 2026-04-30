@@ -394,7 +394,7 @@ func (d *Daemon) syncAllAccounts(ctx context.Context) {
 
 		if noClients && newCount > 0 {
 			if !d.config.DisableNotifications {
-				go notify.Send("Matcha", fmt.Sprintf("New mail for %s", acct.Email))
+				go notify.Send("Matcha", fmt.Sprintf("New mail for %s", acct.FetchEmail))
 			}
 		}
 	}
